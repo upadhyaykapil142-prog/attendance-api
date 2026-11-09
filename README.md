@@ -56,6 +56,11 @@ python -m uvicorn app.main:app --reload --port 8000
 
 Then open:
 
+## Live demo
+
+- API: https://attendance-api-phi.vercel.app
+- Docs: https://attendance-api-phi.vercel.app/docs
+- Health: https://attendance-api-phi.vercel.app/health
 - Interactive docs: http://127.0.0.1:8000/docs
 - Health check: http://127.0.0.1:8000/health
 
