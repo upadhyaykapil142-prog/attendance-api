@@ -4,6 +4,8 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience, real env vars win)
 """
+import calendar
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
@@ -13,14 +15,22 @@ from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()  # override=False by default: real environment variables win
 
+logger = logging.getLogger("attendance-api")
+
 # tz_aware=True: Mongo datetimes come back with UTC tzinfo (no naive datetimes)
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
+# serverSelectionTimeoutMS: fail fast (5s) instead of hanging 30s when Mongo is unreachable
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -29,12 +39,17 @@ EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Indexes created at startup, idempotent
-    db.employees.create_index([("emp_code", ASCENDING)], unique=True)
-    db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
-    db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
-    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
-    db.attendance_logs.create_index([("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)])
+    # Indexes created at startup, idempotent.
+    # If MongoDB is unreachable, the app still starts so /health can report 503
+    # instead of the whole function crashing with a 500.
+    try:
+        db.employees.create_index([("emp_code", ASCENDING)], unique=True)
+        db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+        db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
+        db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+        db.attendance_logs.create_index([("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)])
+    except Exception as exc:
+        logger.error("Could not create indexes at startup: %s", exc)
     yield
 
 
@@ -171,9 +186,27 @@ class PunchInIn(BaseModel):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None
+
+
+class RegularizeIn(BaseModel):
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 # --------------------------------------------------------------------------- #
-# Endpoints
+# Root + health
 # --------------------------------------------------------------------------- #
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/health")
 def health():
     try:
@@ -183,6 +216,9 @@ def health():
     return {"status": "ok"}
 
 
+# --------------------------------------------------------------------------- #
+# Employees
+# --------------------------------------------------------------------------- #
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
@@ -210,6 +246,9 @@ def list_employees(
             "total": total, "page": page, "page_size": page_size}
 
 
+# --------------------------------------------------------------------------- #
+# Attendance: punch-in, list, punch-out
+# --------------------------------------------------------------------------- #
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -269,20 +308,6 @@ def list_attendance(
             "total": total, "page": page, "page_size": page_size}
 
 
-# TODO next steps: punch-out, PATCH, analytics, explain
-
-
-# --------------------------------------------------------------------------- #
-# Step 3: punch-out
-# --------------------------------------------------------------------------- #
-from pymongo import ReturnDocument
-
-
-class PunchOutIn(BaseModel):
-    emp_code: str
-    punched_at: Optional[EpochMillis] = None
-
-
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -326,16 +351,8 @@ def punch_out(body: PunchOutIn):
 
 
 # --------------------------------------------------------------------------- #
-# Step 4: PATCH /attendance/{emp_code}/{date}  (regularize)
+# PATCH /attendance/{emp_code}/{date}  (regularize)
 # --------------------------------------------------------------------------- #
-class RegularizeIn(BaseModel):
-    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
-    punch_in: Optional[EpochMillis] = None
-    punch_out: Optional[EpochMillis] = None
-    reason: str = Field(min_length=5, max_length=200)
-    regularized_by: str = Field(min_length=1, max_length=50)
-
-
 @app.patch("/attendance/{emp_code}/{day}")
 def regularize(emp_code: str, day: date, body: RegularizeIn):
     emp = db.employees.find_one({"emp_code": emp_code})
@@ -416,10 +433,8 @@ def regularize(emp_code: str, day: date, body: RegularizeIn):
 
 
 # --------------------------------------------------------------------------- #
-# Step 5a: GET /analytics/employees/{emp_code}/monthly
+# Analytics helpers
 # --------------------------------------------------------------------------- #
-import calendar
-
 MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
 PRESENCE = ["PRESENT", "WFH", "ON_DUTY"]
 
@@ -445,6 +460,9 @@ def count_working_days(first, last, joined_on):
     return n
 
 
+# --------------------------------------------------------------------------- #
+# GET /analytics/employees/{emp_code}/monthly
+# --------------------------------------------------------------------------- #
 def employee_monthly_pipeline(emp_code, month):
     first, last = month_bounds(month)
     return [
@@ -494,10 +512,9 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
     }
 
 
-# ---------------------------------------------------------------------------
-# Step 5b: GET /analytics/departments/summary
-# ---------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------- #
+# GET /analytics/departments/summary
+# --------------------------------------------------------------------------- #
 def department_summary_pipeline(month: str, department: Optional[str] = None):
     first, last = month_bounds(month)
 
@@ -693,10 +710,9 @@ def department_summary(
     return {"month": month, "items": items}
 
 
-# ---------------------------------------------------------------------------
-# Step 5c: GET /analytics/leaderboard/late
-# ---------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------- #
+# GET /analytics/leaderboard/late
+# --------------------------------------------------------------------------- #
 def late_leaderboard_pipeline(
     month: str,
     limit: int = 10,
